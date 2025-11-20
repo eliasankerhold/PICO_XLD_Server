@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xld-server"
-version = "0.2.0"
+version = "0.2.1"
 description = "Server package for XLD client management"
 readme = "README.md"
 authors = [{ name = "Elias Ankerhold", email = "elias.ankerhold@aalto.fi" }]
@@ -29,7 +29,7 @@ dependencies = [
 requires-python = ">=3.9"
 
 [tool.setuptools]
-packages = ['XLDServer']
+packages = ['xldserver']
 
 [tool.setuptools.package-data]
 XLDServer = ["static/*.css", "templates/*.html"]

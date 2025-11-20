@@ -1,35 +1,58 @@
 import sys
 
-from src.server.XLDServer.database_sqlite import ServerDB
-from passkey import db_filename
+from xldserver.database_sqlite import ServerDB
+from passkey import DB_FILENAME
+from tasklib import pause_for_next_execution
 
 import numpy as np
 from time import sleep
 from datetime import datetime
 from multiprocessing import Event
 import logging
+# from event_logger import xld_logger
 
-xld_logger = logging.getLogger('waitress')
+# xld_logger = logging.getLogger('waitress')
 
 
 class TemperatureSweep:
-    def __init__(self, thermalization_time, power_array, client_timeout, return_to_base: bool = False,
+    def __init__(self, thermalization_time, client_timeout, mode: str, power_array = None, temperature_array = None, return_to_base: bool = False,
                  abort_flag: Event = Event(), is_running: Event = Event(), test_mode: bool = False,
-                 skip_first: bool = False):
+                 skip_first: bool = False, debug: bool = False):
+        assert power_array is not None or temperature_array is not None, "Must provide either power or temperature array!"
         self.thermalization_time = float(thermalization_time)
         self.power_array = np.array(power_array)
-        self.db = ServerDB(db_filename)
+        self.temperature_array = np.array(temperature_array)
+        self.db = ServerDB()
         self.client_timeout = float(client_timeout)
-        self.test_mode = float(test_mode)
+        self.test_mode = bool(test_mode)
         self.abort_flag = abort_flag
         self.is_running = is_running
         self.return_to_base = return_to_base
         self.skip_first = skip_first
+        assert mode in self.db.heater_modes, "Choose valid heater mode!"
+        self.mode = mode
+        self.unit = 'mK' if self.mode == 'setpoint' else 'uW'
+        
+        log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s] [%(name)s] %(message)s")
+        
+        level = logging.INFO if not debug else logging.DEBUG
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(log_formatter)
+        console_handler.setLevel(level)
+        
+        self.logger = logging.getLogger('TEMP-SWEEP')
+        self.logger.addHandler(console_handler)
+        self.logger.setLevel(level)
+        
+        self.db.write_heater_mode(index=self.db.mxc_ind, mode=self.mode)
+        print(f'reading db heater mode {self.db.read_heater_mode(index=self.db.mxc_ind)}')
 
     def wait_for_all_clients(self):
         start = datetime.now()
         done = False
         while not done:
+            self.logger.info(f'waiting... {self.db.get_all_meas_signals()}')
             self._try_abort()
             done = True
             for signal, crashed in self.db.get_all_meas_signals():
@@ -43,56 +66,65 @@ class TemperatureSweep:
                         self.db.set_meas_as_crashed(meas_id=meas['id'])
                 done = True
 
-            sleep(5)
+            sleep(1)
+            # self.logger.info(f'waiting... {self.db.get_all_meas_signals()}')
 
     def start_all_client_meas(self):
         self.db.set_all_meas_to_go()
 
     def exec(self):
         self.is_running.set()
-        xld_logger.info(f'TEMPERATURE CONTROL: Making sure that all clients are ready.')
+        self.logger.info(f'Making sure that all clients are ready.')
+        self.logger.info(f'Waiting... {self.db.get_all_meas_signals()}')
         self.wait_for_all_clients()
-        xld_logger.info(f'TEMPERATURE CONTROL: Started sweep.')
+        self.logger.info(f'Started sweep.')
+        
+        sweep_array = self.power_array if self.power_array is not None else self.temperature_array
 
-        for i, power in enumerate(self.power_array):
-            self._try_abort()
-            if not self.test_mode:
-                self.db.write_heater(index=self.db.mxc_ind, val=float(power))
-            xld_logger.info(f'TEMPERATURE CONTROL: Set heater power to {power} uW.')
+        for i, value in enumerate(sweep_array):
+            self.db.write_heater(index=self.db.mxc_ind, val=float(value), mode=self.mode)
+            self.logger.info(f'Set heater {self.mode} to {value} {self.unit}.')
             if i == 0:
                 if not self.skip_first:
-                    xld_logger.info(f'TEMPERATURE CONTROL: Waiting {self.thermalization_time} s for thermalization.')
-                    if not self.test_mode:
-                        sleep(self.thermalization_time)
+                    self.logger.info(f'Waiting {self.thermalization_time} s for thermalization.')
+                    if self.test_mode:
+                        self.logger.info(f'Skipping thermalization in test mode, waiting 10 seconds.')
+                        if not pause_for_next_execution(interval=10, abort=self.abort_flag):
+                            self._try_abort()
+                    else:
+                        if not pause_for_next_execution(interval=self.thermalization_time, abort=self.abort_flag):
+                            self._try_abort()
                 else:
-                    xld_logger.info(f'TEMPERATURE CONTROL: Skipping first thermalization.')
+                    self.logger.info(f'Skipping first thermalization.')
             else:
-                xld_logger.info(f'TEMPERATURE CONTROL: Waiting {self.thermalization_time} s for thermalization.')
-                if not self.test_mode:
-                    sleep(self.thermalization_time)
-            self._try_abort()
-            xld_logger.info(
-                f'TEMPERATURE CONTROL: Thermalization done. Current temperature at mixing chamber: '
+                self.logger.info(f'Waiting {self.thermalization_time} s for thermalization.')
+                if self.test_mode:
+                        self.logger.info(f'Skipping thermalization in test mode, waiting 10 seconds.')
+                        if not pause_for_next_execution(interval=10, abort=self.abort_flag):
+                            self._try_abort()
+                else:
+                        if not pause_for_next_execution(interval=self.thermalization_time, abort=self.abort_flag):
+                            self._try_abort()
+            self.logger.info(
+                f'Thermalization done. Current temperature at mixing chamber: '
                 f'{self.db.read_temp(channel=self.db.mxc_ch)} K')
             self.start_all_client_meas()
-            xld_logger.info(f'TEMPERATURE CONTROL: Send GO signal to all measurement clients.')
+            self.logger.info(f'Send GO signal to all measurement clients.')
             if not self.test_mode:
-                sleep(30)
-            self._try_abort()
-            xld_logger.info(
-                f'TEMPERATURE CONTROL: Waiting for all measurements to finish at current '
-                f'temperature point ({i + 1}/{len(self.power_array)}).')
+                if not pause_for_next_execution(interval=30, abort=self.abort_flag):
+                    self._try_abort()
+            self.logger.info(
+                f'Waiting for all measurements to finish at current '
+                f'temperature point ({i + 1}/{len(sweep_array)}).')
             self.wait_for_all_clients()
-            xld_logger.info(f'TEMPERATURE CONTROL: All measurements finished at current temperature point.')
-            self._try_abort()
+            self.logger.info(f'All measurements finished at current temperature point.')
 
         if self.return_to_base:
-            xld_logger.info(f'TEMPERATURE CONTROL: Returning to base temperature.')
-            if not self.test_mode:
-                self.db.write_heater(index=self.db.mxc_ind, val=0.0)
+            self.logger.info(f'Returning to base temperature.')
+            self.db.write_heater(index=self.db.mxc_ind, val=0.0, mode='power')
 
         else:
-            xld_logger.info(f'TEMPERATURE CONTROL: Not returning to base temperature.')
+            self.logger.info(f'Not returning to base temperature.')
 
         self.is_running.clear()
         if not self.test_mode:
@@ -104,15 +136,15 @@ class TemperatureSweep:
         if self.abort_flag.is_set():
             self.abort_flag.clear()
             self.is_running.clear()
-            xld_logger.info(f'TEMPERATURE CONTROL: SWEEP ABORTED!')
-            sys.exit()
+            self.logger.info(f'SWEEP ABORTED!')
+            sys.exit('Succuessfully aborted temperature sweep. This is a planned error message and is no cause for concern!\n=================================================================================================================\n')
 
         else:
             return False
 
 
 class TemperatureSweepManager:
-    def __init__(self):
+    def __init__(self, debug: bool = False):
         self.modes = ['pid', 'direct-power']
         self.interpolations = ['linear', 'quadratic', 'manual']
 
@@ -128,6 +160,18 @@ class TemperatureSweepManager:
         self.confirmed = False
         self.started = False
         self.client_dict = {}
+        
+        log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s] [%(name)s] %(message)s")
+        
+        level = logging.INFO if not debug else logging.DEBUG
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(log_formatter)
+        console_handler.setLevel(level)
+        
+        self.logger = logging.getLogger('TEMP-SWEEP-MAN')
+        self.logger.addHandler(console_handler)
+        self.logger.setLevel(level)
 
         self.generate_html_dict()
 
@@ -156,31 +200,44 @@ class TemperatureSweepManager:
             assert 'min_pow' in params.keys()
             assert 'max_pow' in params.keys()
             assert 'n_pow' in params.keys()
-
-        if sweep_mode == 'pid':
-            raise NotImplementedError
+            
 
         self.params = params
         self.mode = sweep_mode
         self.interpolation = interpolation
+        assert 'therm_time' in self.params.keys()
+        self.therm_time = self.params['therm_time']
+        
+        if self.mode == 'pid':
+            
+            if self.interpolation == 'linear':
+                self.sweep_array = np.linspace(float(self.params['min_temp']), float(self.params['max_temp']), int(self.params['n_steps']))
+                
+            elif self.interpolation == 'manual':
+                lines = self.params['values'].split('\n')
+                lines = [float(i) for i in lines]
+                self.sweep_array = np.array(lines)
 
-        if self.mode == 'direct-power':
-            assert 'therm_time' in self.params.keys()
-            self.therm_time = self.params['therm_time']
+        elif self.mode == 'direct-power':
 
             if self.interpolation == 'linear':
                 self.sweep_array = np.linspace(float(self.params['min_pow']), float(self.params['max_pow']),
                                                int(self.params['n_pow']))
 
             elif self.interpolation == 'quadratic':
-                self.sweep_array = np.square(
-                    np.linspace(float(self.params['min_pow']), np.sqrt(float(self.params['max_pow'])),
-                                int(self.params['n_pow'])))
+                minp, maxp, n = float(self.params['min_pow']), float(self.params['max_pow']), int(self.params['n_pow']) 
+                self.sweep_array = minp + (maxp - minp) / n ** 2 * np.square(np.linspace(0, n, n))
+
+                # self.sweep_array = np.square(
+                #     np.linspace(float(self.params['min_pow']), np.sqrt(float(self.params['max_pow'])),
+                #                 int(self.params['n_pow'])))
 
             elif self.interpolation == 'manual':
                 lines = self.params['values'].split('\n')
                 lines = [float(i) for i in lines]
                 self.sweep_array = np.array(lines)
+                
+        self.sweep_array = np.round(self.sweep_array, 1)
 
         self.generate_html_dict()
 
@@ -188,12 +245,13 @@ class TemperatureSweepManager:
         assert not self.confirmed
         ret = 'RETURN' if self.return_to_base else 'NOT RETURN'
         skip = 'SKIP' if self.skip_first else 'NOT SKIP'
-        html_dict = {'sweep_mode': self.mode, 'interpolation': self.interpolation,
+        html_dict = {'sweep_mode': self.mode, 
+                     'interpolation': self.interpolation,
                      'vals': [f' {v:.0f}' for v in self.sweep_array],
-                     'cl_timeout': self.cl_timeout, 'ret_base': ret, 'skip_first': skip}
-
-        if self.mode == 'direct-power' or self.mode == '':
-            html_dict['therm_time'] = self.therm_time
+                     'cl_timeout': self.cl_timeout, 
+                     'ret_base': ret, 
+                     'skip_first': skip,
+                     'therm_time': self.therm_time}
 
         self.html_dict = html_dict
 
@@ -202,7 +260,7 @@ class TemperatureSweepManager:
         self.confirmed = True
         self.client_dict = {'abort_in_progress': False, 'confirmed': True, 'sweep_points': len(self.sweep_array),
                             'client_timeout': self.cl_timeout}
-        xld_logger.info("TEMPERATURE CONTROL: Parameters set to broadcasted.")
+        self.logger.info("Parameters set to broadcasted.")
 
     def start_sweep(self):
         assert not self.started and self.confirmed
@@ -210,7 +268,7 @@ class TemperatureSweepManager:
         self.client_dict = {'abort_in_progress': False, 'sweep_started': True, 'confirmed': True,
                             'sweep_points': len(self.sweep_array),
                             'client_timeout': self.cl_timeout}
-        xld_logger.info("TEMPERATURE CONTROL: Sweep set to started.")
+        self.logger.info("Sweep set to started.")
 
     def clear(self):
         self.mode = ''

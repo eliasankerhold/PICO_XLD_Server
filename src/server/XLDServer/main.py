@@ -11,25 +11,29 @@ from flask_login import LoginManager, UserMixin
 import json
 
 import os
-from passkey import key, users, blueftc_ip, xld_ip, data_dir
+from passkey import KEY, USERS, BLUEFORS_CONTROL_IP, SERVER_HOST_IP, DATA_DIR, MXC_HEATER_ID, MXC_CHANNEL_ID, ACTIVE_CHANNELS, PORT, PID_CALIB_FILE
 
-if not os.path.isdir(data_dir):
+if not os.path.isdir(DATA_DIR):
     try:
-        os.mkdir(data_dir)
+        os.mkdir(DATA_DIR)
     except Exception as ex:
-        print(f'Log directory creation failed! Cannot create {data_dir}')
+        print(f'Log directory creation failed! Cannot create {DATA_DIR}')
         print(ex)
         sys.exit()
 
 from tempcomm import XLDTempHandler
 from database_sqlite import ServerDB
 from temperature_sweep import TemperatureSweepManager, TemperatureSweep
+from event_logger import xld_logger
 
+emulate_temp_controller = True
+emulate_sweep = True
+debug = False
 db = ServerDB()
 db.prep_tables()
 
 app = Flask(__name__)
-app.secret_key = key
+app.secret_key = KEY
 
 login_manager = LoginManager()
 login_manager.login_view = 'login'
@@ -39,13 +43,19 @@ t_sweep_manager = TemperatureSweepManager()
 
 abort = Event()
 sweep_running = Event()
+global_crash = Event()
 
-log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s")
-log_file = os.path.join(data_dir, "xld_events.log")
-noop = logging.NullHandler()
-logging.getLogger().addHandler(noop)
-wrkzg_logger = logging.getLogger('waitress')
+log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s] [%(name)s] %(message)s")
+    
+level = logging.INFO if not debug else logging.DEBUG
 
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+global_logger = logging.getLogger('GLOBAL')
+global_logger.setLevel(level)
+global_logger.addHandler(console_handler)
 
 class User(UserMixin):
     def __init__(self, id):
@@ -53,32 +63,20 @@ class User(UserMixin):
 
 
 def exec_flask():
-    file_handler = TimedRotatingFileHandler(log_file, when='W0')
-    file_handler.setFormatter(log_formatter)
-    file_handler.setLevel(logging.INFO)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_formatter)
-    console_handler.setLevel(logging.INFO)
-
-    flask_file_handler = TimedRotatingFileHandler(os.path.join(data_dir, "flask_events.log"), when='W0')
-    flask_file_handler.setFormatter(log_formatter)
-    flask_file_handler.setLevel(logging.INFO)
-
-    wrkzg_logger.addHandler(flask_file_handler)
-    wrkzg_logger.addHandler(file_handler)
-    wrkzg_logger.addHandler(console_handler)
-
     app.config['TEMPLATES_AUTO_RELOAD'] = True
 
-    wrkzg_logger.setLevel(logging.INFO)
-    serve(app, host=xld_ip)
+    serve(app, host=SERVER_HOST_IP)
 
 
 @login_manager.user_loader
 def load_user(user_id):
     return User(user_id)
 
+# @app.before_request
+# def before_request():
+#     print('here', global_crash.is_set())
+#     if global_crash.is_set():
+#         sys.exit('FATAL ERROR')
 
 @app.route("/meas/register", methods=['POST'])
 def meas_reg():
@@ -128,12 +126,21 @@ def broadcast_temp_sweep():
 
     elif payload['start']:
         if not t_sweep_manager.started and not sweep_running.is_set():
+            if t_sweep_manager.mode == 'direct-power':
+                tmode = 'power'
+                
+            elif t_sweep_manager.mode == 'pid':
+                tmode = 'setpoint'
+                
+            else:
+                raise NotImplementedError('Not a valid sweep mode.')
             t_sweep = TemperatureSweep(thermalization_time=float(t_sweep_manager.therm_time) * 60,
                                        power_array=t_sweep_manager.sweep_array,
                                        client_timeout=float(t_sweep_manager.cl_timeout) * 60,
-                                       abort_flag=abort, is_running=sweep_running, test_mode=False,
+                                       abort_flag=abort, is_running=sweep_running, test_mode=emulate_sweep,
                                        return_to_base=t_sweep_manager.return_to_base,
-                                       skip_first=t_sweep_manager.skip_first)
+                                       skip_first=t_sweep_manager.skip_first,
+                                       mode=tmode)
             t_sweep_manager.start_sweep()
             sweep_running.set()
             t_sweep_process = Process(target=t_sweep.exec(), name='Temperature Sweep')
@@ -146,13 +153,13 @@ def broadcast_temp_sweep():
 @flask_login.login_required
 def abort_temp_sweep():
     if t_sweep_manager.started and sweep_running.is_set():
-        wrkzg_logger.info('FLASK SERVER: Abort sweep initiated.')
+        global_logger.info('Abort sweep initiated.')
         abort.set()
         t_sweep_manager.clear()
         return json.dumps({'aborted': False, 'initiated': True})
 
     elif not sweep_running.is_set():
-        wrkzg_logger.info("FLASK SERVER: Abort confirmed.")
+        global_logger.info("Abort confirmed.")
         abort.clear()
         return json.dumps({'aborted': True, 'initiated': True})
 
@@ -194,7 +201,7 @@ def login():
     if request.method == "POST":
         user_id = request.form.get("username")
         entered_password = request.form.get("password")
-        if user_id in users and users[user_id]['password'] == entered_password:
+        if user_id in USERS and USERS[user_id]['password'] == entered_password:
             user = User(user_id)
             flask_login.login_user(user)
             flash('Login successful', 'Success!')
@@ -251,11 +258,11 @@ def control():
         return render_template("not_available.html")
 
     if request.method == "POST":
-        new_power = request.form.get("power")
-        heater_id = request.form.get("heater select")
-        if heater_id == 'mixing chamber':
-            db.write_heater(index=db.mxc_ind, val=float(new_power))
-            return redirect('/control')
+        mode = request.form.get('mode select')
+        new_value = request.form.get("value")
+        assert mode in db.heater_modes, "Not a valid heater mode"
+        db.write_heater(index=db.mxc_ind, val=float(new_value), mode=mode)
+        return redirect('/control')
 
     else:
         return render_template("control.html", powers=get_all_powers(), temps=get_all_temps())
@@ -287,25 +294,32 @@ def json_request_handler():
 
 
 def get_all_temps():
-    temps = {'mxc': db.read_temp(db.mxc_ch),
-             'still': db.read_temp(db.still_ch),
-             'four_k': db.read_temp(db.fourk_ch),
-             'fifty_k': db.read_temp(db.fiftyk_ch)}
+    temps = {'mxc': f'{db.read_temp(db.mxc_ch) * 1e3:4.2f}',
+             'still': f'{db.read_temp(db.still_ch) * 1e3:4.2f}',
+             'four_k': f'{db.read_temp(db.fourk_ch):2.0f}',
+             'fifty_k': f'{db.read_temp(db.fiftyk_ch):2.0f}'}
 
     return temps
 
 
 def get_all_powers():
-    powers = {'mxc': db.read_heater(db.mxc_ind),
-              'still': db.read_heater(db.still_ind),
-              'mxc_switch': db.read_heater(db.mxc_switch_ind),
-              'still_switch': db.read_heater(db.still_switch_ind)}
+    mode = db.read_heater_mode(db.mxc_ind)
+    mode_str = 'ERROR'
+    if mode == 'setpoint':
+        mode_str = 'PID Control'
+    elif mode == 'power':
+        mode_str = 'Direct Power Control'
+    powers = {'mxc': f'{db.read_heater(db.mxc_ind, mode='power'):4.3f}',
+              'mxc_setpoint': f'{db.read_heater(db.mxc_ind, mode='setpoint'):4.2f}',
+              'mxc_mode': mode_str}
 
     return powers
 
 
 def exec_tcontrol():
-    tccontrol = XLDTempHandler(database=db, ip=blueftc_ip, update_interval=5)
+    tccontrol = XLDTempHandler(database=db, ip=BLUEFORS_CONTROL_IP, update_interval=5, emulate=emulate_temp_controller, 
+                               active_channels=ACTIVE_CHANNELS, api_key=KEY, port=PORT, mxc_id=MXC_CHANNEL_ID, heater_id=MXC_HEATER_ID, 
+                               init_mode='setpoint', debug=debug, abort=abort, pid_calib=PID_CALIB_FILE, global_crash=global_crash)
     tccontrol.exec()
 
 
@@ -315,3 +329,5 @@ tc_process = Process(target=exec_tcontrol, name='Temperature Controller')
 if __name__ == "__main__":
     flask_server.start()
     tc_process.start()
+    # app.run(debug=True)
+    # exec_flask()

@@ -9,20 +9,23 @@
             <p>Still: {{ temps.still }} K</p>
             <p>4K Stage: {{ temps.four_k }} K</p>
             <p>50K Stage: {{ temps.fifty_k }} K</p>
-        <h3>Heaters</h3>
-            <p>Mixing Chamber: {{ powers.mxc }} uW</p>
-            <p>Still: {{ powers.still }} uW</p>
-            <p>Heatswitch Mixing Chamber: {{ powers.mxc_switch }} uW</p>
-            <p>Heatswitch Still: {{ powers.still_switch }} uW</p>
+        <h3>Mixing Chamber Heater</h3>
+            <p>Mode: {{ powers.mxc_mode }}</p>
+            <p>Applied Power: {{ powers.mxc }} uW</p>
+            <p>Temperature Setpoint: {{ powers.mxc_setpoint }} mK</p>
     </div>
     <form method="POST">
-        <label for="power">Change Heating Power (uW):</label>
-        <input type="number" id="power" name="power" step=0.1 required>
-        <label for="heater select">Heater:</label>
-        <select id="heater select" name="heater select">
-            <option value="mixing chamber">Mixing Chamber</option>
-        </select>
-        <button class="button" type="submit">Set Power</button>
+        <h3>Set Mixing Chamber Heater</h3>
+        <p><label for="mode select">Mode:</label>
+        <select id="mode select" name="mode select">
+            <option value="setpoint">PID Control</option>
+            <option value="power">Direct Power Control</option>
+        </select></br>
+        <label for="value">Value:</label>
+        <input type="number" id="value" name="value" step=0.1 required>
+        <label>(mK or uW)</label>
+        </p>
+        <button class="button" type="submit">Set</button>
     </form>
 </div>
 {% endblock %}

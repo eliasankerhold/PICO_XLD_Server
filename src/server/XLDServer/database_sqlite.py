@@ -4,17 +4,19 @@ from datetime import datetime
 from multiprocessing import Lock
 import sqlite3 as sq
 import logging
+from logging import Logger
 import os
 
-from measurements import WAIT, GO, RUNNING, CRASHED
-from passkey import data_dir, db_filename
+from xldserver.measurements import WAIT, GO, RUNNING, CRASHED
+from passkey import DATA_DIR, DB_FILENAME
+# from event_logger import xld_logger
 
-xld_logger = logging.getLogger('waitress')
+# xld_logger = logging.getLogger('waitress')
 
 
 @dataclass
 class ServerDB:
-    db_name: str = os.path.join(data_dir, db_filename)
+    db_name: str = os.path.join(DATA_DIR, DB_FILENAME)
     meas_lock: Lock = Lock()
     temp_lock: Lock = Lock()
     heater_lock: Lock = Lock()
@@ -26,16 +28,37 @@ class ServerDB:
     still_ind: int = 3
     mxc_switch_ind: int = 2
     still_switch_ind: int = 1
+    heater_modes: list = None
+    logger: Logger = None
+    debug: bool = False
+    
+    def __post_init__(self):
+        self.heater_modes = ['power', 'setpoint']
+        self.heater_mode_keys = [0, 1]
+        log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s] [%(name)s] %(message)s")
+        
+        level = logging.INFO if not self.debug else logging.DEBUG
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(log_formatter)
+        console_handler.setLevel(level)
+        
+        self.logger = logging.getLogger('DATABASE')
+        self.logger.addHandler(console_handler)
+        self.logger.setLevel(level)
 
     def _exec_db_command(self, cmd: str, params: tuple = ()):
         with sq.connect(self.db_name) as con:
             return con.execute(cmd, params)
+        
+    def _debug(self, msg):
+        self.logger.debug(f"({self.db_name}): {msg}")
 
     def _info(self, msg):
-        xld_logger.info(f"DATABASE OPERATION: {msg}")
+        self.logger.info(f"({self.db_name}): {msg}")
 
     def _warning(self, msg):
-        xld_logger.warning(f"DATABASE OPERATION: {msg}")
+        self.logger.warning(f"({self.db_name}): {msg}")
 
     def prep_tables(self):
         self._exec_db_command('''CREATE TABLE if not exists clients
@@ -54,6 +77,8 @@ class ServerDB:
         self._exec_db_command('''CREATE TABLE if not exists heaters
         (h_ind NUMERIC PRIMARY KEY,
         power NUMERIC,
+        setpoint NUMERIC,
+        mode INTEGER,
         tstamp DATETIME)''')
 
         self._info("Created database tables.")
@@ -133,7 +158,7 @@ class ServerDB:
                                   "DO UPDATE SET temp = ?, tstamp = ?",
                                   (channel, val, timestamp, val, timestamp))
 
-            self._info(f'Written temp = {val} to channel {channel}.')
+            self._debug(f'Written temp = {val} to channel {channel}.')
 
     def read_temp(self, channel: int):
         with self.temp_lock:
@@ -146,26 +171,50 @@ class ServerDB:
             else:
                 return 0
 
-    def write_heater(self, index: int, val: float, timestamp: datetime = datetime.now()):
+    def write_heater(self, index: int, val: float, mode: str, timestamp: datetime = datetime.now()):
+        assert mode in self.heater_modes, f"{mode} is not a valid heater mode!"
+        mode_int = self.heater_modes.index(mode)
+        cmd_str = f"INSERT INTO heaters (h_ind, {mode}, mode, tstamp) VALUES (?, ?, ?, ?) ON CONFLICT(h_ind) DO UPDATE SET {mode} = ?, mode = ?, tstamp = ?"
         with self.heater_lock:
-            self._exec_db_command("INSERT INTO heaters (h_ind, power, tstamp)"
-                                  "VALUES (?, ?, ?)"
-                                  "ON CONFLICT(h_ind)"
-                                  "DO UPDATE SET power = ?, tstamp = ?",
-                                  (index, val, timestamp, val, timestamp))
+            self._exec_db_command(cmd_str,
+                                  (index, val, mode_int, timestamp, val, mode_int, timestamp))
 
-            self._info(f'Written power = {val} to heater {index}.')
+            self._info(f'Written {mode} = {val} to heater {index}.')
 
-    def read_heater(self, index: int):
+    def read_heater(self, index: int, mode: str):
+        assert mode in self.heater_modes, f"{mode} is not a valid heater mode!"
+        cmd_str = f"SELECT {mode} from heaters WHERE h_ind = ?"
         with self.heater_lock:
             cursor = self._exec_db_command(
-                "SELECT power from heaters WHERE h_ind = ?", (index,))
+                cmd_str, (index,))
             ts = [row[0] for row in cursor]
             if ts:
                 return ts[0]
 
             else:
-                return 0
+                return None
+    
+    def read_heater_mode(self, index: int):
+        cmd_str = f"SELECT mode from heaters WHERE h_ind = ?"
+        with self.heater_lock:
+            cursor = self._exec_db_command(
+                cmd_str, (index,))
+            ts = [row[0] for row in cursor]
+            if ts:
+                return self.heater_modes[ts[0]]
+
+            else:
+                return None
+    
+    def write_heater_mode(self, index: int, mode: str, timestamp: datetime = datetime.now()):
+        assert mode in self.heater_modes, f"{mode} is not a valid heater mode!"
+        mode_int = self.heater_modes.index(mode)
+        cmd_str = f"INSERT INTO heaters (h_ind, mode, tstamp) VALUES (?, ?, ?) ON CONFLICT(h_ind) DO UPDATE SET mode = ?, tstamp = ?"
+        with self.heater_lock:
+            self._exec_db_command(cmd_str,
+                                  (index, mode_int, timestamp, mode_int, timestamp))
+
+            self._info(f'Written mode = {mode} (code {mode_int}) to heater {index}.')
 
     def get_meas_signal(self, meas_id):
         with self.meas_lock:

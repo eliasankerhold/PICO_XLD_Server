@@ -6,15 +6,14 @@
 
     <div class="sensor-data">
         <h3>Temperature Sensors</h3>
-            <p>Mixing Chamber: {{ temps.mxc }} K</p>
-            <p>Still: {{ temps.still }} K</p>
+            <p>Mixing Chamber: {{ temps.mxc }} mK</p>
+            <p>Still: {{ temps.still }} mK</p>
             <p>4K Stage: {{ temps.four_k }} K</p>
             <p>50K Stage: {{ temps.fifty_k }} K</p>
-        <h3>Heaters</h3>
-            <p>Mixing Chamber: {{ powers.mxc }} uW</p>
-            <p>Still: {{ powers.still }} uW</p>
-            <p>Heatswitch Mixing Chamber: {{ powers.mxc_switch }} uW</p>
-            <p>Heatswitch Still: {{ powers.still_switch }} uW</p>
+        <h3>Mixing Chamber Heater</h3>
+            <p>Mode: {{ powers.mxc_mode }}</p>
+            <p>Applied Power: {{ powers.mxc }} uW</p>
+            <p>Temperature Setpoint: {{ powers.mxc_setpoint }} mK</p>
     </div>
 </div>
 {% endblock %}
